@@ -177,4 +177,88 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    /// Renames `old_id` to `new_id` for the client's "Change ID", keeping the peer's guid,
+    /// key and info. Only the machine that registered `old_id` (same uuid) may rename it.
+    pub(crate) async fn change_id(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        uuid: &[u8],
+    ) -> register_pk_response::Result {
+        if !hbb_common::is_valid_custom_id(new_id) {
+            return register_pk_response::Result::INVALID_ID_FORMAT;
+        }
+        let Some(peer) = self.get(old_id).await else {
+            return register_pk_response::Result::UUID_MISMATCH;
+        };
+        let (guid, pk, info) = {
+            let p = peer.read().await;
+            if p.guid.is_empty() || p.uuid.as_ref() != uuid {
+                return register_pk_response::Result::UUID_MISMATCH;
+            }
+            (
+                p.guid.clone(),
+                p.pk.clone(),
+                serde_json::to_string(&p.info).unwrap_or_default(),
+            )
+        };
+        if new_id == old_id {
+            return register_pk_response::Result::OK;
+        }
+        // An in-memory entry without a guid is only a placeholder, not a registered peer.
+        if let Some(existing) = self.get(new_id).await {
+            if !existing.read().await.guid.is_empty() {
+                return register_pk_response::Result::ID_EXISTS;
+            }
+        }
+        if let Err(err) = self.db.update_pk(&guid, new_id, &pk, &info).await {
+            log::error!("db.update_pk failed changing id {} to {}: {}", old_id, new_id, err);
+            return register_pk_response::Result::SERVER_ERROR;
+        }
+        let mut map = self.map.write().await;
+        map.remove(old_id);
+        map.insert(new_id.to_owned(), peer);
+        register_pk_response::Result::OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+
+    #[test]
+    fn test_change_id() {
+        change_id_cases();
+    }
+
+    #[tokio::main(flavor = "multi_thread")]
+    async fn change_id_cases() {
+        use register_pk_response::Result::*;
+        let path = std::env::temp_dir().join(format!("hbbs-change-id-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pm = PeerMap {
+            map: Default::default(),
+            db: database::Database::new(path.to_str().unwrap()).await.unwrap(),
+        };
+        pm.db.insert_peer("123456789", b"uuid-a", b"pk-a", "{}").await.unwrap();
+        pm.db.insert_peer("takenid1", b"uuid-b", b"pk-b", "{}").await.unwrap();
+
+        assert_eq!(pm.change_id("123456789", "1bad", b"uuid-a").await, INVALID_ID_FORMAT);
+        assert_eq!(pm.change_id("123456789", "newname1", b"uuid-x").await, UUID_MISMATCH);
+        assert_eq!(pm.change_id("987654321", "newname1", b"uuid-a").await, UUID_MISMATCH);
+        assert_eq!(pm.change_id("123456789", "takenid1", b"uuid-a").await, ID_EXISTS);
+        assert_eq!(pm.change_id("123456789", "newname1", b"uuid-a").await, OK);
+
+        let renamed = pm.db.get_peer("newname1").await.unwrap().unwrap();
+        assert_eq!(renamed.pk, b"pk-a");
+        assert_eq!(renamed.uuid, b"uuid-a");
+        assert!(pm.db.get_peer("123456789").await.unwrap().is_none());
+        assert!(pm.get_in_memory("123456789").await.is_none());
+        assert!(pm.get_in_memory("newname1").await.is_some());
+        // The old id is free again; the renamed peer cannot be renamed from a stale id.
+        assert_eq!(pm.change_id("123456789", "another1", b"uuid-a").await, UUID_MISMATCH);
+        let _ = std::fs::remove_file(&path);
+    }
 }

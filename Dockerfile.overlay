@@ -1,0 +1,14 @@
+# Builds hbbs from this tree and overlays it on the upstream classic image of the same
+# version; hbbr stays exactly as upstream built it.
+ARG BASE_IMAGE=rustdesk/rustdesk-server:1.1.16
+
+FROM rust:1.90-alpine AS builder
+# make: libsodium-sys builds the bundled libsodium with autotools.
+RUN apk add --no-cache musl-dev make
+WORKDIR /src
+COPY . .
+RUN cargo test --release --lib change_id \
+    && cargo build --release --bin hbbs
+
+FROM ${BASE_IMAGE}
+COPY --from=builder /src/target/release/hbbs /usr/bin/hbbs
