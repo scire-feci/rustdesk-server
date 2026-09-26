@@ -7,7 +7,7 @@ FROM rust:1.90-alpine AS builder
 RUN apk add --no-cache musl-dev make
 WORKDIR /src
 COPY . .
-RUN cargo test --release --lib change_id \
+RUN cargo test --release --lib -- change_id secure_tcp \
     && cargo build --release --bin hbbs
 
 FROM ${BASE_IMAGE}

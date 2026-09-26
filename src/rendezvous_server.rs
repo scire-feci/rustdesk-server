@@ -53,6 +53,8 @@ type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungsteni
 enum Sink {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
+    // A TcpStream whose client completed the secure_tcp key exchange.
+    SecureTcp(TcpStreamSink, hbb_common::tcp::Encrypt),
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -843,6 +845,9 @@ impl RendezvousServer {
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
                     }
+                    Sink::SecureTcp(s, enc) => {
+                        allow_err!(s.send(Bytes::from(enc.enc(&bytes))).await);
+                    }
                 }
             }
         }
@@ -1193,7 +1198,29 @@ impl RendezvousServer {
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let mut kx_sk = self.offer_secure_tcp(&mut sink).await;
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(Sink::SecureTcp(_, enc)) = sink.as_mut() {
+                    if enc.dec(&mut bytes).is_err() {
+                        break;
+                    }
+                } else if let Some(sk) = kx_sk.take() {
+                    match crate::secure_tcp::accept(&bytes, &sk) {
+                        Some(Ok(k)) => {
+                            if let Some(Sink::TcpStream(s)) = sink.take() {
+                                let enc = hbb_common::tcp::Encrypt::new(k);
+                                sink = Some(Sink::SecureTcp(s, enc));
+                            }
+                            log::info!("secured tcp connection from {}", addr);
+                            continue;
+                        }
+                        Some(Err(err)) => {
+                            log::warn!("secure tcp handshake from {} failed: {}", addr, err);
+                            break;
+                        }
+                        None => {}
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1204,6 +1231,18 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// Offers the client's secure_tcp key exchange when this server has a signing key;
+    /// returns the ephemeral secret key needed to read the answer.
+    async fn offer_secure_tcp(
+        &self,
+        sink: &mut Option<Sink>,
+    ) -> Option<hbb_common::sodiumoxide::crypto::box_::SecretKey> {
+        let server_sk = self.inner.sk.as_ref()?;
+        let (msg, sk) = crate::secure_tcp::offer(server_sk);
+        Self::send_to_sink(sink, msg).await;
+        Some(sk)
     }
 
     #[inline]
